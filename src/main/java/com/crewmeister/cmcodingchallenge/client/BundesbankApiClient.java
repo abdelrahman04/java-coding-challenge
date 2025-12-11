@@ -121,12 +121,14 @@ public class BundesbankApiClient {
     /**
      * Builds the API URL for fetching exchange rates.
      * Uses the BBEX3 series which contains daily EUR exchange rates.
+     * Limits to last 365 observations to avoid loading too much historical data.
      */
     private String buildApiUrl(String currencyCode) {
         // BBEX3 is the series identifier for EUR foreign exchange rates
         // D = daily frequency
         // Format: BBEX3/D.{CURRENCY}.EUR.BB.AC.000
-        return String.format("%s/BBEX3/D.%s.EUR.BB.AC.000", baseUrl, currencyCode);
+        // Limit to last 365 days to avoid overwhelming the database on startup
+        return String.format("%s/BBEX3/D.%s.EUR.BB.AC.000?lastNObservations=365", baseUrl, currencyCode);
     }
 
     /**
