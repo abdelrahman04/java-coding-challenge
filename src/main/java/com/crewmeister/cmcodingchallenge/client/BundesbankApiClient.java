@@ -4,6 +4,10 @@ import com.crewmeister.cmcodingchallenge.exception.ExternalApiException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
@@ -16,8 +20,8 @@ import java.util.*;
 /**
  * Client for fetching exchange rate data from the Bundesbank API.
  * 
- * The Bundesbank provides daily exchange rates through their statistics API.
- * Data format is CSV with time series information.
+ * The Bundesbank provides daily exchange rates through their SDMX REST API.
+ * Data is requested in CSV format for easier parsing.
  */
 @Component
 public class BundesbankApiClient {
@@ -93,11 +97,24 @@ public class BundesbankApiClient {
         logger.info("Fetching exchange rates for {} from Bundesbank API", currencyCode);
 
         try {
-            String response = restTemplate.getForObject(url, String.class);
-            return parseExchangeRateResponse(response);
+            // Set Accept header for CSV format
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Accept", "text/csv");
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
+            String csvResponse = response.getBody();
+            
+            if (logger.isDebugEnabled() && csvResponse != null) {
+                String preview = csvResponse.length() > 500 ? csvResponse.substring(0, 500) : csvResponse;
+                logger.debug("API Response preview: {}", preview);
+            }
+            
+            return parseExchangeRateResponse(csvResponse);
         } catch (RestClientException e) {
             logger.error("Failed to fetch exchange rates for {}: {}", currencyCode, e.getMessage());
-            throw new ExternalApiException("Failed to fetch exchange rates from Bundesbank API", e);
+            // Return empty map instead of throwing, so other currencies can still be fetched
+            return Collections.emptyMap();
         }
     }
 
@@ -109,12 +126,12 @@ public class BundesbankApiClient {
         // BBEX3 is the series identifier for EUR foreign exchange rates
         // D = daily frequency
         // Format: BBEX3/D.{CURRENCY}.EUR.BB.AC.000
-        return String.format("%s/BBEX3/D.%s.EUR.BB.AC.000?format=csv", baseUrl, currencyCode);
+        return String.format("%s/BBEX3/D.%s.EUR.BB.AC.000", baseUrl, currencyCode);
     }
 
     /**
      * Parses the CSV response from Bundesbank API.
-     * The CSV format contains time series data with date and value columns.
+     * The SDMX-CSV format has headers and data with semicolon or comma separators.
      */
     private Map<LocalDate, BigDecimal> parseExchangeRateResponse(String csvResponse) {
         Map<LocalDate, BigDecimal> rates = new TreeMap<>();
@@ -124,46 +141,65 @@ public class BundesbankApiClient {
             return rates;
         }
 
-        String[] lines = csvResponse.split("\n");
-        boolean dataSection = false;
+        String[] lines = csvResponse.split("\\r?\\n");
+        int timePeriodIndex = -1;
+        int obsValueIndex = -1;
+        String delimiter = ",";
 
         for (String line : lines) {
-            line = line.trim();
-            
-            if (line.isEmpty()) {
+            if (line.trim().isEmpty()) {
                 continue;
             }
 
-            // Skip header lines until we reach the data
-            if (!dataSection) {
-                // Look for the data section - typically starts after metadata
-                if (line.startsWith("TIME_PERIOD") || line.contains(",OBS_VALUE")) {
-                    dataSection = true;
+            // Detect delimiter (CSV can use comma or semicolon)
+            if (line.contains(";")) {
+                delimiter = ";";
+            }
+
+            String[] parts = line.split(delimiter);
+
+            // Find header row and identify column indices
+            if (timePeriodIndex == -1) {
+                for (int i = 0; i < parts.length; i++) {
+                    String col = parts[i].trim().replace("\"", "").toUpperCase();
+                    if (col.equals("TIME_PERIOD")) {
+                        timePeriodIndex = i;
+                    } else if (col.equals("OBS_VALUE")) {
+                        obsValueIndex = i;
+                    }
+                }
+                // If we found the headers, continue to next line for data
+                if (timePeriodIndex != -1 && obsValueIndex != -1) {
+                    continue;
+                }
+                // If this line has headers, skip it
+                if (timePeriodIndex != -1 || obsValueIndex != -1) {
                     continue;
                 }
                 continue;
             }
 
-            // Parse data lines
-            String[] parts = line.split(",|;");
-            if (parts.length >= 2) {
+            // Parse data rows
+            if (parts.length > Math.max(timePeriodIndex, obsValueIndex)) {
                 try {
-                    String dateStr = parts[0].trim().replace("\"", "");
-                    String valueStr = parts[1].trim().replace("\"", "");
+                    String dateStr = parts[timePeriodIndex].trim().replace("\"", "");
+                    String valueStr = parts[obsValueIndex].trim().replace("\"", "");
 
                     // Skip if value is empty or marked as not available
-                    if (valueStr.isEmpty() || valueStr.equals(".") || valueStr.equals("-")) {
+                    if (valueStr.isEmpty() || valueStr.equals(".") || valueStr.equals("-") || valueStr.equalsIgnoreCase("NaN")) {
                         continue;
                     }
 
                     LocalDate date = parseDate(dateStr);
                     BigDecimal rate = new BigDecimal(valueStr);
-                    
+
                     if (date != null && rate.compareTo(BigDecimal.ZERO) > 0) {
                         rates.put(date, rate);
                     }
                 } catch (NumberFormatException e) {
-                    logger.debug("Skipping invalid rate value in line: {}", line);
+                    logger.trace("Skipping invalid rate value in line: {}", line);
+                } catch (Exception e) {
+                    logger.trace("Error parsing line: {} - {}", line, e.getMessage());
                 }
             }
         }
@@ -173,21 +209,29 @@ public class BundesbankApiClient {
     }
 
     /**
-     * Parses date strings in various formats.
+     * Parses date strings in various formats used by Bundesbank.
      */
     private LocalDate parseDate(String dateStr) {
+        if (dateStr == null || dateStr.isEmpty()) {
+            return null;
+        }
+        
         try {
-            // Handle different date formats
+            // Handle yyyy-MM-dd format
             if (dateStr.matches("\\d{4}-\\d{2}-\\d{2}")) {
                 return LocalDate.parse(dateStr, DATE_FORMATTER);
-            } else if (dateStr.matches("\\d{4}-\\d{2}")) {
-                // Monthly data - use first day of month
+            }
+            // Handle yyyy-MM format (monthly data)
+            if (dateStr.matches("\\d{4}-\\d{2}")) {
                 return LocalDate.parse(dateStr + "-01", DATE_FORMATTER);
             }
+            // Handle yyyy format (yearly data)
+            if (dateStr.matches("\\d{4}")) {
+                return LocalDate.parse(dateStr + "-01-01", DATE_FORMATTER);
+            }
         } catch (Exception e) {
-            logger.debug("Failed to parse date: {}", dateStr);
+            logger.trace("Failed to parse date: {}", dateStr);
         }
         return null;
     }
 }
-

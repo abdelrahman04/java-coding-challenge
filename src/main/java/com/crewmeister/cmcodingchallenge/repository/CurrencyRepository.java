@@ -23,3 +23,4 @@ public interface CurrencyRepository extends JpaRepository<Currency, String> {
     boolean existsByCurrencyCode(String currencyCode);
 }
 
+
